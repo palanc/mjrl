@@ -45,7 +45,7 @@ class MLP(torch.nn.Module):
 
         # Policy network
         # ------------------------
-        self.layer_sizes = (self.observation_dim, ) + hidden_sizes + (self.action_dim, )
+        self.layer_sizes = (self.observation_dim, ) + tuple(hidden_sizes) + (self.action_dim, )
         self.nonlinearity = torch.tanh
         self.fc_layers = torch.nn.ModuleList([torch.nn.Linear(self.layer_sizes[i], self.layer_sizes[i+1])
                                              for i in range(len(self.layer_sizes)-1)])

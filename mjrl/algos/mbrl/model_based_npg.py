@@ -6,6 +6,7 @@ import pickle
 import mjrl.envs
 import os
 import time as timer
+import mjrl.samplers.core as sampler
 from torch.autograd import Variable
 from mjrl.utils.gym_env import GymEnv
 from mjrl.algos.mbrl.nn_dynamics import WorldModel
@@ -15,6 +16,7 @@ import mjrl.samplers.core as trajectory_sampler
 import mjrl.utils.process_samples as process_samples
 from mjrl.utils.logger import DataLog
 from mjrl.algos.mbrl.sampling import policy_rollout
+
 
 # Import NPG
 from mjrl.algos.npg_cg import NPG
@@ -70,6 +72,7 @@ class ModelBasedNPG(NPG):
                    termination_function=None,
                    truncate_lim=None,
                    truncate_reward=0.0,
+                   gt_rollouts=False,
                    **kwargs,
                    ):
 
@@ -104,71 +107,77 @@ class ModelBasedNPG(NPG):
         assert type(init_states) == list
         assert len(init_states) == N
 
-        # set policy device to be same as learned model
-        self.policy.to(self.learned_model[0].device)
+        if not gt_rollouts:
+            # set policy device to be same as learned model
+            self.policy.to(self.learned_model[0].device)
+            for model in self.learned_model:
+                # dont set seed explicitly -- this will make rollouts follow tne global seed
+                rollouts = policy_rollout(num_traj=N, env=env, policy=self.policy,
+                                          learned_model=model, eval_mode=False, horizon=horizon,
+                                       init_state=init_states, seed=None)
+                # use learned reward function if available
+                if model.learn_reward:
+                    model.compute_path_rewards(rollouts)
+                else:
+                    rollouts = reward_function(rollouts)
+                    # scale by action repeat if necessary
+                    rollouts["rewards"] = rollouts["rewards"] * env.act_repeat
+                num_traj, horizon, state_dim = rollouts['observations'].shape
+                for i in range(num_traj):
+                    path = dict()
+                    for key in rollouts.keys():
+                        path[key] = rollouts[key][i, ...]
+                    paths.append(path)
 
-        for model in self.learned_model:
-            # dont set seed explicitly -- this will make rollouts follow tne global seed
-            rollouts = policy_rollout(num_traj=N, env=env, policy=self.policy,
-                                      learned_model=model, eval_mode=False, horizon=horizon,
-                                      init_state=init_states, seed=None)
-            # use learned reward function if available
-            if model.learn_reward:
-                model.compute_path_rewards(rollouts)
+            # NOTE: If tasks have termination condition, we will assume that the env has
+            # a function that can terminate paths appropriately.
+            # Otherwise, termination is not considered.
+
+            if callable(termination_function): 
+                paths = termination_function(paths)
             else:
-               rollouts = reward_function(rollouts)
-               # scale by action repeat if necessary
-               rollouts["rewards"] = rollouts["rewards"] * env.act_repeat
-            num_traj, horizon, state_dim = rollouts['observations'].shape
-            for i in range(num_traj):
-                path = dict()
-                for key in rollouts.keys():
-                    path[key] = rollouts[key][i, ...]
-                paths.append(path)
+                # mark unterminated
+                for path in paths: path['terminated'] = False
 
-        # NOTE: If tasks have termination condition, we will assume that the env has
-        # a function that can terminate paths appropriately.
-        # Otherwise, termination is not considered.
+            # remove paths that are too short
+            paths = [path for path in paths if path['observations'].shape[0] >= 5]
 
-        if callable(termination_function): 
-            paths = termination_function(paths)
+            # additional truncation based on error in the ensembles
+            if truncate_lim is not None and len(self.learned_model) > 1:
+                for path in paths:
+                    pred_err = np.zeros(path['observations'].shape[0] - 1)
+                    s = path['observations'][:-1]
+                    a = path['actions'][:-1]
+                    s_next = path['observations'][1:]
+                    for idx_1, model_1 in enumerate(self.learned_model):
+                        pred_1 = model_1.predict(s, a)
+                        for idx_2, model_2 in enumerate(self.learned_model):
+                            if idx_2 > idx_1:
+                                pred_2 = model_2.predict(s, a)
+                                # model_err = np.mean((pred_1 - pred_2)**2, axis=-1)
+                                model_err = np.linalg.norm((pred_1-pred_2), axis=-1)
+                                pred_err = np.maximum(pred_err, model_err)
+                    violations = np.where(pred_err > truncate_lim)[0]
+                    truncated = (not len(violations) == 0)
+                    T = violations[0] + 1 if truncated else path['observations'].shape[0]
+                    T = max(4, T)   # we don't want corner cases of very short truncation
+                    path["observations"] = path["observations"][:T]
+                    path["actions"] = path["actions"][:T]
+                    path["rewards"] = path["rewards"][:T]
+                    if truncated: path["rewards"][-1] += truncate_reward
+                    path["terminated"] = False if T == path['observations'].shape[0] else True
         else:
-            # mark unterminated
-            for path in paths: path['terminated'] = False
-
-        # remove paths that are too short
-        paths = [path for path in paths if path['observations'].shape[0] >= 5]
-
-        # additional truncation based on error in the ensembles
-        if truncate_lim is not None and len(self.learned_model) > 1:
-            for path in paths:
-                pred_err = np.zeros(path['observations'].shape[0] - 1)
-                s = path['observations'][:-1]
-                a = path['actions'][:-1]
-                s_next = path['observations'][1:]
-                for idx_1, model_1 in enumerate(self.learned_model):
-                    pred_1 = model_1.predict(s, a)
-                    for idx_2, model_2 in enumerate(self.learned_model):
-                        if idx_2 > idx_1:
-                            pred_2 = model_2.predict(s, a)
-                            # model_err = np.mean((pred_1 - pred_2)**2, axis=-1)
-                            model_err = np.linalg.norm((pred_1-pred_2), axis=-1)
-                            pred_err = np.maximum(pred_err, model_err)
-                violations = np.where(pred_err > truncate_lim)[0]
-                truncated = (not len(violations) == 0)
-                T = violations[0] + 1 if truncated else path['observations'].shape[0]
-                T = max(4, T)   # we don't want corner cases of very short truncation
-                path["observations"] = path["observations"][:T]
-                path["actions"] = path["actions"][:T]
-                path["rewards"] = path["rewards"][:T]
-                if truncated: path["rewards"][-1] += truncate_reward
-                path["terminated"] = False if T == path['observations'].shape[0] else True
+            self.policy.to('cpu')
+            paths = sampler.sample_data_batch(N*env.horizon, env, 
+                        self.policy, eval_mode=False, base_seed=self.seed, num_cpu=num_cpu)
+            # remove paths that are too short
+            paths = [path for path in paths if path['observations'].shape[0] >= 5]
 
         if self.save_logs:
             self.logger.log_kv('time_sampling', timer.time() - ts)
 
         self.seed = self.seed + N if self.seed is not None else self.seed
-
+        #print('NPG seed: %d' % (self.seed))
         # compute returns
         process_samples.compute_returns(paths, gamma)
         # compute advantages

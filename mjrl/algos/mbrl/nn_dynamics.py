@@ -182,7 +182,7 @@ class DynamicsNet(nn.Module):
         torch.manual_seed(seed)
         self.state_dim, self.act_dim, self.hidden_size = state_dim, act_dim, hidden_size
         self.out_dim = state_dim if out_dim is None else out_dim
-        self.layer_sizes = (state_dim + act_dim, ) + hidden_size + (self.out_dim, )
+        self.layer_sizes = (state_dim + act_dim, ) + tuple(hidden_size) + (self.out_dim, )
         # hidden layers
         self.fc_layers = nn.ModuleList([nn.Linear(self.layer_sizes[i], self.layer_sizes[i+1])
                                         for i in range(len(self.layer_sizes)-1)])
